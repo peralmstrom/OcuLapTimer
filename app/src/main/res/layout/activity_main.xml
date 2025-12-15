@@ -25,41 +25,117 @@
         android:layout_height="match_parent"
         android:layout_weight="1"
         android:orientation="vertical"
-        android:padding="8dp"
+        android:padding="4dp"
         android:background="#EEEEEE">
-
-        <Button
-            android:id="@+id/btn_register"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Register Car" />
-
-        <Button
-            android:id="@+id/btn_start_race"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Start Race" />
 
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Leaderboard"
+            android:text="LEADERBOARD"
             android:textStyle="bold"
-            android:paddingTop="8dp"/>
+            android:gravity="start"
+            android:textSize="18sp"
+            android:textColor="#333333"/>
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="2dp"
+            android:background="#333333"
+            android:layout_marginTop="2dp"
+            android:layout_marginBottom="4dp"/>
 
         <androidx.recyclerview.widget.RecyclerView
             android:id="@+id/recycler_view_cars"
             android:layout_width="match_parent"
             android:layout_height="0dp"
             android:layout_weight="1"
-            android:scrollbars="vertical" />
+            android:scrollbars="vertical"
+            android:layout_marginBottom="4dp"/>
 
-        <Button
-            android:id="@+id/btn_end_race"
+        <TextView
+            android:id="@+id/tv_race_status"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:backgroundTint="#FF0000"
-            android:textColor="#FFFFFF"
-            android:text="End Race" />
+            android:text=""
+            android:gravity="center"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:textColor="#D32F2F"
+            android:paddingBottom="4dp"/>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btn_register"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="REG"
+                android:textSize="12sp"
+                android:layout_marginEnd="2dp"
+                android:backgroundTint="#2196F3"
+                android:textColor="#FFFFFF"
+                android:insetTop="0dp"
+                android:insetBottom="0dp"
+                android:insetLeft="0dp"
+                android:insetRight="0dp"
+                android:minWidth="0dp"
+                android:paddingHorizontal="0dp"/>
+
+            <Button
+                android:id="@+id/btn_start_race"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="GO!"
+                android:textSize="12sp"
+                android:layout_marginEnd="2dp"
+                android:backgroundTint="#4CAF50"
+                android:textColor="#FFFFFF"
+                android:insetTop="0dp"
+                android:insetBottom="0dp"
+                android:insetLeft="0dp"
+                android:insetRight="0dp"
+                android:minWidth="0dp"
+                android:paddingHorizontal="0dp"/>
+
+            <Button
+                android:id="@+id/btn_finish"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="END"
+                android:textSize="12sp"
+                android:layout_marginEnd="2dp"
+                android:backgroundTint="#F44336"
+                android:textColor="#FFFFFF"
+                android:insetTop="0dp"
+                android:insetBottom="0dp"
+                android:insetLeft="0dp"
+                android:insetRight="0dp"
+                android:minWidth="0dp"
+                android:paddingHorizontal="0dp"/>
+
+            <Button
+                android:id="@+id/btn_clear"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="CLR"
+                android:textSize="12sp"
+                android:backgroundTint="#607D8B"
+                android:textColor="#FFFFFF"
+                android:insetTop="0dp"
+                android:insetBottom="0dp"
+                android:insetLeft="0dp"
+                android:insetRight="0dp"
+                android:minWidth="0dp"
+                android:paddingHorizontal="0dp"/>
+
+        </LinearLayout>
+
     </LinearLayout>
 </LinearLayout>
