@@ -80,7 +80,8 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
     private CountDownTimer raceTimer;
 
     // Registration logic
-    private boolean regCarWasLeft = true;
+    private boolean regCarWasLeft = false;
+    private boolean regCarWasRight = false;
     private long lastRegTime = 0;
     private int registrationFramesProcessed = 0;
 
@@ -185,7 +186,11 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
         isRegistering = true;
         isRaceActive = false;
         isCountdownActive = false;
-        regCarWasLeft = true;
+
+        // Reset detection flags to prevent immediate triggering
+        regCarWasLeft = false;
+        regCarWasRight = false;
+
         registrationFramesProcessed = 0;
 
         updateButtonState();
@@ -453,10 +458,8 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
     }
 
     private void processRegistration(Mat rgba) {
-        // 1. Prepare Motion Mask (Same as processRace)
         mog2.apply(rgba, fgMask);
 
-        // Calibration phase
         if (registrationFramesProcessed < 30) {
             registrationFramesProcessed++;
             Imgproc.putText(rgba, "CALIBRATING...", new Point(50, 100),
@@ -464,38 +467,47 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
             return;
         }
 
-        // 2. Apply SAME morphological ops as processRace
-        // This ensures the 'shape' we learn is the same 'shape' we detect later.
+        // Apply same robust morphology as Race Mode (ensures body+wheels are one blob)
         Imgproc.erode(fgMask, fgMask, dilateElement);
         Imgproc.dilate(fgMask, fgMask, dilateElement);
-        Imgproc.dilate(fgMask, fgMask, dilateElement); // <--- Added to match Race logic
+        Imgproc.dilate(fgMask, fgMask, dilateElement);
 
         List<MatOfPoint> contours = new ArrayList<>();
         Imgproc.findContours(fgMask, contours, hierarchyMat, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
 
         for (MatOfPoint contour : contours) {
-            // Keep threshold higher for registration (3000) to ensure we get a "good look" at the car
-            // whereas race mode (500) is more sensitive to catch fast movers.
             if (Imgproc.contourArea(contour) > 3000) {
                 Rect rect = Imgproc.boundingRect(contour);
                 Imgproc.rectangle(rgba, rect, new Scalar(255, 255, 0), 2);
 
                 int cX = rect.x + (rect.width / 2);
 
-                // Simple logic to detect when a car crosses from Left -> Right
+                // --- Bidirectional Logic ---
+
+                // 1. Mark where we are currently seeing the car
                 if (cX < finishLineX) {
                     regCarWasLeft = true;
-                } else if (regCarWasLeft) {
+                } else {
+                    regCarWasRight = true;
+                }
+
+                // 2. Check for crossing
+                // (Is it on the Right now, but we previously saw it on the Left?)
+                boolean crossedLeftToRight = (cX > finishLineX && regCarWasLeft);
+
+                // (Is it on the Left now, but we previously saw it on the Right?)
+                boolean crossedRightToLeft = (cX < finishLineX && regCarWasRight);
+
+                if (crossedLeftToRight || crossedRightToLeft) {
                     long now = System.currentTimeMillis();
-                    // Debounce to prevent double-registering
                     if (now - lastRegTime > 2000) {
                         lastRegTime = now;
-                        // This function uses 'fgMask' to calculate the average color.
-                        // Since we dilated 'fgMask' above, the captured color will now include
-                        // the wheels/edges, matching the race logic perfectly.
                         captureCarColor(rgba, rect);
+
+                        // Reset flags so we don't double-register this same crossing
+                        regCarWasLeft = false;
+                        regCarWasRight = false;
                     }
-                    regCarWasLeft = false;
                 }
             }
         }
