@@ -453,28 +453,46 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
     }
 
     private void processRegistration(Mat rgba) {
+        // 1. Prepare Motion Mask (Same as processRace)
         mog2.apply(rgba, fgMask);
+
+        // Calibration phase
         if (registrationFramesProcessed < 30) {
             registrationFramesProcessed++;
-            Imgproc.putText(rgba, "CALIBRATING...", new Point(50, 100), Imgproc.FONT_HERSHEY_SIMPLEX, 1.0, new Scalar(0, 0, 255), 2);
+            Imgproc.putText(rgba, "CALIBRATING...", new Point(50, 100),
+                    Imgproc.FONT_HERSHEY_SIMPLEX, 1.0, new Scalar(0, 0, 255), 2);
             return;
         }
+
+        // 2. Apply SAME morphological ops as processRace
+        // This ensures the 'shape' we learn is the same 'shape' we detect later.
         Imgproc.erode(fgMask, fgMask, dilateElement);
         Imgproc.dilate(fgMask, fgMask, dilateElement);
+        Imgproc.dilate(fgMask, fgMask, dilateElement); // <--- Added to match Race logic
 
         List<MatOfPoint> contours = new ArrayList<>();
         Imgproc.findContours(fgMask, contours, hierarchyMat, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
 
         for (MatOfPoint contour : contours) {
+            // Keep threshold higher for registration (3000) to ensure we get a "good look" at the car
+            // whereas race mode (500) is more sensitive to catch fast movers.
             if (Imgproc.contourArea(contour) > 3000) {
                 Rect rect = Imgproc.boundingRect(contour);
                 Imgproc.rectangle(rgba, rect, new Scalar(255, 255, 0), 2);
+
                 int cX = rect.x + (rect.width / 2);
-                if (cX < finishLineX) regCarWasLeft = true;
-                else if (regCarWasLeft) {
+
+                // Simple logic to detect when a car crosses from Left -> Right
+                if (cX < finishLineX) {
+                    regCarWasLeft = true;
+                } else if (regCarWasLeft) {
                     long now = System.currentTimeMillis();
+                    // Debounce to prevent double-registering
                     if (now - lastRegTime > 2000) {
                         lastRegTime = now;
+                        // This function uses 'fgMask' to calculate the average color.
+                        // Since we dilated 'fgMask' above, the captured color will now include
+                        // the wheels/edges, matching the race logic perfectly.
                         captureCarColor(rgba, rect);
                     }
                     regCarWasLeft = false;
@@ -534,11 +552,19 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
     }
 
     private void processRace(Mat rgba, boolean recordStats) {
+        // 1. Prepare Motion Mask (Global for the frame)
         mog2.apply(rgba, fgMask);
+
+        // Dilate to merge disjoint parts (like wheels and body) into one blob
+        // Doing this twice or using a larger kernel helps ensure the car is one solid object
         Imgproc.erode(fgMask, fgMask, dilateElement);
         Imgproc.dilate(fgMask, fgMask, dilateElement);
+        Imgproc.dilate(fgMask, fgMask, dilateElement); // Extra dilation for robustness
+
+        // 2. Prepare Color Space
         Imgproc.cvtColor(rgba, hsvMat, Imgproc.COLOR_RGB2HSV);
 
+        // Local class for candidates (same as before)
         class Candidate {
             final Car car;
             final Rect rect;
@@ -555,33 +581,53 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
 
         List<Candidate> allCandidates = new ArrayList<>();
 
-        for (Car car : new ArrayList<>(carList)) {
-            Core.inRange(hsvMat, car.lower, car.upper, maskMat);
-            Core.bitwise_and(maskMat, fgMask, combinedMask);
-            Imgproc.dilate(combinedMask, combinedMask, dilateElement);
+        // 3. Find Contours on the MOTION mask (not color masks)
+        // This identifies distinct physical objects moving in the scene
+        List<MatOfPoint> motionContours = new ArrayList<>();
+        Imgproc.findContours(fgMask, motionContours, hierarchyMat, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
 
-            List<MatOfPoint> contours = new ArrayList<>();
-            Imgproc.findContours(combinedMask, contours, hierarchyMat, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
+        for (MatOfPoint contour : motionContours) {
+            // Filter out small noise
+            if (Imgproc.contourArea(contour) > 500) {
+                Rect rect = Imgproc.boundingRect(contour);
 
-            for (MatOfPoint contour : contours) {
-                if (Imgproc.contourArea(contour) > 500) {
-                    Rect rect = Imgproc.boundingRect(contour);
-                    Mat blobRegion = new Mat(hsvMat, rect);
-                    Scalar blobHsv = Core.mean(blobRegion);
-                    blobRegion.release();
+                // 4. Analyze the Color of this Moving Object
+                // We use the fgMask as a mask for 'mean' to only average the pixels that are actually moving
+                // (This ignores the background inside the bounding box, giving a purer car color)
+                Mat objectHsv = new Mat(hsvMat, rect);
+                Mat objectMask = new Mat(fgMask, rect);
+                Scalar blobHsv = Core.mean(objectHsv, objectMask);
 
+                objectHsv.release();
+                objectMask.release();
+
+                // 5. Find which Car this object looks like the most
+                Car bestCar = null;
+                double bestScore = Double.MAX_VALUE;
+
+                for (Car car : carList) {
                     double score = car.getScore(blobHsv);
+                    if (score < bestScore) {
+                        bestScore = score;
+                        bestCar = car;
+                    }
+                }
+
+                // Create ONE candidate for this physical object
+                if (bestCar != null) {
                     Point center = new Point(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
-                    allCandidates.add(new Candidate(car, rect, center, score));
+                    allCandidates.add(new Candidate(bestCar, rect, center, bestScore));
                 }
             }
         }
 
+        // 6. Sort and Visuals (Logic largely preserved from your original code)
         allCandidates.sort((c1, c2) -> Double.compare(c1.score, c2.score));
         List<Point> acceptedCenters = new ArrayList<>();
 
         for (Candidate cand : allCandidates) {
             boolean isDuplicate = false;
+            // Existing spatial duplicate check (still useful if a car splits into two motion blobs)
             for (Point accepted : acceptedCenters) {
                 double dist = Math.sqrt(Math.pow(cand.center.x - accepted.x, 2) + Math.pow(cand.center.y - accepted.y, 2));
                 if (dist < 50) {
@@ -593,9 +639,12 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
             if (isDuplicate) continue;
             acceptedCenters.add(cand.center);
 
+            // Draw visuals
             Imgproc.rectangle(rgba, cand.rect, new Scalar(0, 255, 0), 2);
-            Imgproc.putText(rgba, cand.car.name, new Point(cand.rect.x, cand.rect.y - 10), Imgproc.FONT_HERSHEY_SIMPLEX, 0.5, new Scalar(0, 255, 0), 2);
+            Imgproc.putText(rgba, cand.car.name, new Point(cand.rect.x, cand.rect.y - 10),
+                    Imgproc.FONT_HERSHEY_SIMPLEX, 0.5, new Scalar(0, 255, 0), 2);
 
+            // 7. Update Race Stats
             int cX = (int) cand.center.x;
             int currentSide = (cX < finishLineX) ? Car.SIDE_LEFT : Car.SIDE_RIGHT;
 
@@ -613,6 +662,7 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
                         }
 
                         runOnUiThread(() -> {
+                            // Sort leaderboard by laps/time? The user code sorted by bestLapVal
                             carList.sort((c1, c2) -> Double.compare(c1.bestLapVal, c2.bestLapVal));
                             carAdapter.notifyDataSetChanged();
                         });
