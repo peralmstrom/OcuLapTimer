@@ -50,6 +50,13 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
 
     private static final String TAG = "LapTimer";
 
+    // Detection Thresholds
+    private static final double MIN_RAW_CONTOUR_AREA = 500.0;
+    private static final double MIN_MERGED_OBJECT_AREA = 3000.0;
+    // Score threshold for duplicates. Lower = stricter similarity required.
+    private static final double DUPLICATE_SCORE_THRESHOLD = 150.0;
+    private static final long REGISTRATION_COOLDOWN_MS = 3000;
+
     // UI Components
     private JavaCameraView cameraView;
     private CarAdapter carAdapter;
@@ -59,7 +66,7 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
 
     // OpenCV Mats & Objects
     private Mat hsvMat, maskMat, hierarchyMat, dilateElement;
-    private Mat fgMask, combinedMask;
+    private Mat fgMask;
     private BackgroundSubtractorMOG2 mog2;
 
     // Audio
@@ -80,8 +87,11 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
     private CountDownTimer raceTimer;
 
     // Registration logic
-    private boolean regCarWasLeft = true;
+    private boolean regCarWasLeft = false;
+    private boolean regCarWasRight = false;
+    private volatile boolean isPausedForDialog = false;
     private long lastRegTime = 0;
+    private long lastCarAddedTime = 0;
     private int registrationFramesProcessed = 0;
 
     @Override
@@ -90,7 +100,6 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         setContentView(R.layout.activity_main);
 
-        // Audio Setup: MUSIC stream, 100% volume
         toneGen = new ToneGenerator(AudioManager.STREAM_MUSIC, 100);
 
         cameraView = findViewById(R.id.camera_view);
@@ -185,13 +194,17 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
         isRegistering = true;
         isRaceActive = false;
         isCountdownActive = false;
-        regCarWasLeft = true;
+
+        regCarWasLeft = false;
+        regCarWasRight = false;
+        isPausedForDialog = false;
         registrationFramesProcessed = 0;
 
         updateButtonState();
         tvRaceStatus.setText("Registration Mode");
 
-        if (mog2 != null) mog2 = Video.createBackgroundSubtractorMOG2(100, 50, false);
+        // High threshold to ignore shadows and subtle lighting changes
+        if (mog2 != null) mog2 = Video.createBackgroundSubtractorMOG2(100, 100, false);
         Toast.makeText(this, "Calibrating... Wait 1 second...", Toast.LENGTH_LONG).show();
     }
 
@@ -219,16 +232,25 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
                 carList.add(newCar);
                 carAdapter.notifyDataSetChanged();
 
-                regCarWasLeft = true;
-                registrationFramesProcessed = 0;
+                lastCarAddedTime = System.currentTimeMillis();
+
                 tvRaceStatus.setText("Car Added! Drive next car...");
                 toneGen.startTone(ToneGenerator.TONE_PROP_BEEP);
                 Toast.makeText(this, "Car Added! Ready for next.", Toast.LENGTH_SHORT).show();
+
+                // Resume detection
+                regCarWasLeft = false;
+                regCarWasRight = false;
+                registrationFramesProcessed = 0;
+                isPausedForDialog = false;
             });
 
             builder.setNegativeButton("Retry", (dialog, which) -> {
-                regCarWasLeft = true;
+                // Resume detection
+                regCarWasLeft = false;
+                regCarWasRight = false;
                 registrationFramesProcessed = 0;
+                isPausedForDialog = false;
             });
             builder.setCancelable(false);
             builder.show();
@@ -300,7 +322,6 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
                 countdownText = String.valueOf(seconds);
                 tvRaceStatus.setText("Starting in " + seconds + "...");
 
-                // AUDIO: Skip first doot (5), beep on 4, 3, 2, 1
                 if (seconds < 5) {
                     toneGen.startTone(ToneGenerator.TONE_CDMA_PIP, 150);
                 }
@@ -308,10 +329,7 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
 
             public void onFinish() {
                 countdownText = "GO!";
-
-                // AUDIO: Long Horn for GO
                 toneGen.startTone(ToneGenerator.TONE_DTMF_0, 600);
-
                 startRace();
 
                 new CountDownTimer(1000, 1000) {
@@ -365,7 +383,6 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
         Toast.makeText(this, "Race Finished: " + reason, Toast.LENGTH_LONG).show();
     }
 
-    // --- Lifecycle & Permissions ---
     @Override
     protected void onPause() {
         super.onPause();
@@ -404,16 +421,14 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
         }
     }
 
-    // --- OpenCV Callbacks ---
     @Override
     public void onCameraViewStarted(int width, int height) {
         hsvMat = new Mat();
         maskMat = new Mat();
         hierarchyMat = new Mat();
         fgMask = new Mat();
-        combinedMask = new Mat();
         dilateElement = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(5, 5));
-        mog2 = Video.createBackgroundSubtractorMOG2(100, 50, false);
+        mog2 = Video.createBackgroundSubtractorMOG2(100, 100, false);
         finishLineX = width / 2;
     }
 
@@ -423,7 +438,6 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
         if (maskMat != null) maskMat.release();
         if (hierarchyMat != null) hierarchyMat.release();
         if (fgMask != null) fgMask.release();
-        if (combinedMask != null) combinedMask.release();
         if (dilateElement != null) dilateElement.release();
     }
 
@@ -452,32 +466,99 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
         return rgba;
     }
 
+    /**
+     * Helper to merge nearby or overlapping rectangles into a single bounding box.
+     * turns "fragmented" detections (wheels, body, glare) into one solid object.
+     */
+    private List<Rect> consolidateRects(List<Rect> inputs) {
+        boolean merged = true;
+        while (merged) {
+            merged = false;
+            for (int i = 0; i < inputs.size(); i++) {
+                for (int j = i + 1; j < inputs.size(); j++) {
+                    Rect r1 = inputs.get(i);
+                    Rect r2 = inputs.get(j);
+
+                    // Check if they are close (within 50 pixels) or overlapping
+                    boolean closeX = (r1.x < r2.x + r2.width + 50) && (r2.x < r1.x + r1.width + 50);
+                    boolean closeY = (r1.y < r2.y + r2.height + 50) && (r2.y < r1.y + r1.height + 50);
+
+                    if (closeX && closeY) {
+                        int x = Math.min(r1.x, r2.x);
+                        int y = Math.min(r1.y, r2.y);
+                        int w = Math.max(r1.x + r1.width, r2.x + r2.width) - x;
+                        int h = Math.max(r1.y + r1.height, r2.y + r2.height) - y;
+
+                        inputs.set(i, new Rect(x, y, w, h));
+                        inputs.remove(j);
+                        merged = true;
+                        break;
+                    }
+                }
+                if (merged) break;
+            }
+        }
+        return inputs;
+    }
+
     private void processRegistration(Mat rgba) {
-        mog2.apply(rgba, fgMask);
-        if (registrationFramesProcessed < 30) {
-            registrationFramesProcessed++;
-            Imgproc.putText(rgba, "CALIBRATING...", new Point(50, 100), Imgproc.FONT_HERSHEY_SIMPLEX, 1.0, new Scalar(0, 0, 255), 2);
+        // Prevent rapid-fire registering of the same car
+        if (System.currentTimeMillis() - lastCarAddedTime < REGISTRATION_COOLDOWN_MS) {
             return;
         }
+
+        if (isPausedForDialog) return;
+
+        mog2.apply(rgba, fgMask);
+
+        if (registrationFramesProcessed < 30) {
+            registrationFramesProcessed++;
+            Imgproc.putText(rgba, "CALIBRATING...", new Point(50, 100),
+                    Imgproc.FONT_HERSHEY_SIMPLEX, 1.0, new Scalar(0, 0, 255), 2);
+            return;
+        }
+
+        // Dilate to merge disjoint parts (body + wheels) into a single blob.
         Imgproc.erode(fgMask, fgMask, dilateElement);
+        Imgproc.dilate(fgMask, fgMask, dilateElement);
         Imgproc.dilate(fgMask, fgMask, dilateElement);
 
         List<MatOfPoint> contours = new ArrayList<>();
         Imgproc.findContours(fgMask, contours, hierarchyMat, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
 
+        List<Rect> rawRects = new ArrayList<>();
         for (MatOfPoint contour : contours) {
-            if (Imgproc.contourArea(contour) > 3000) {
-                Rect rect = Imgproc.boundingRect(contour);
+            if (Imgproc.contourArea(contour) > MIN_RAW_CONTOUR_AREA) {
+                rawRects.add(Imgproc.boundingRect(contour));
+            }
+        }
+
+        List<Rect> mergedRects = consolidateRects(rawRects);
+
+        for (Rect rect : mergedRects) {
+            if (rect.width * rect.height > MIN_MERGED_OBJECT_AREA) {
                 Imgproc.rectangle(rgba, rect, new Scalar(255, 255, 0), 2);
+
                 int cX = rect.x + (rect.width / 2);
-                if (cX < finishLineX) regCarWasLeft = true;
-                else if (regCarWasLeft) {
+
+                // Bidirectional crossing logic
+                if (cX < finishLineX) {
+                    regCarWasLeft = true;
+                } else {
+                    regCarWasRight = true;
+                }
+
+                boolean crossedLeftToRight = (cX > finishLineX && regCarWasLeft);
+                boolean crossedRightToLeft = (cX < finishLineX && regCarWasRight);
+
+                if (crossedLeftToRight || crossedRightToLeft) {
                     long now = System.currentTimeMillis();
+                    // Debounce individual object crossing
                     if (now - lastRegTime > 2000) {
                         lastRegTime = now;
+                        isPausedForDialog = true;
                         captureCarColor(rgba, rect);
                     }
-                    regCarWasLeft = false;
                 }
             }
         }
@@ -487,6 +568,8 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
         Mat carRegion = new Mat(rgba, rect);
         Mat carHsv = new Mat();
         Imgproc.cvtColor(carRegion, carHsv, Imgproc.COLOR_RGB2HSV);
+
+        // Use fgMask to get only the moving pixels (the car), not the background
         Mat maskRegion = new Mat(fgMask, rect);
         Scalar avgHsv = Core.mean(carHsv, maskRegion);
 
@@ -505,6 +588,7 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
         double valTol = 40;
         Scalar lower, upper;
 
+        // Handle wrapping for bounds generation (0-180 circle)
         if (h < hueTol) {
             lower = new Scalar(0, Math.max(0, s - satTol), Math.max(0, v - valTol));
             upper = new Scalar(h + hueTol, Math.min(255, s + satTol), Math.min(255, v + valTol));
@@ -516,16 +600,17 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
             upper = new Scalar(Math.min(180, h + hueTol), Math.min(255, s + satTol), Math.min(255, v + valTol));
         }
 
+        // Duplicate Check via Similarity Score
         for (Car existingCar : carList) {
-            boolean hOverlap = (h >= existingCar.lower.val[0] && h <= existingCar.upper.val[0]);
-            boolean sOverlap = (s >= existingCar.lower.val[1] && s <= existingCar.upper.val[1]);
-            boolean vOverlap = (v >= existingCar.lower.val[2] && v <= existingCar.upper.val[2]);
+            double score = existingCar.getScore(avgHsv);
 
-            if (hOverlap && sOverlap && vOverlap) {
+            if (score < DUPLICATE_SCORE_THRESHOLD) {
                 runOnUiThread(() ->
-                        Toast.makeText(this, "Too similar to " + existingCar.name + "! Try again.", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(this, "Known Car (" + existingCar.name + ") detected. Ignoring.", Toast.LENGTH_SHORT).show()
                 );
-                regCarWasLeft = true;
+                isPausedForDialog = false;
+                regCarWasLeft = false;
+                regCarWasRight = false;
                 return;
             }
         }
@@ -535,9 +620,24 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
 
     private void processRace(Mat rgba, boolean recordStats) {
         mog2.apply(rgba, fgMask);
+
         Imgproc.erode(fgMask, fgMask, dilateElement);
         Imgproc.dilate(fgMask, fgMask, dilateElement);
+        Imgproc.dilate(fgMask, fgMask, dilateElement);
+
         Imgproc.cvtColor(rgba, hsvMat, Imgproc.COLOR_RGB2HSV);
+
+        List<MatOfPoint> motionContours = new ArrayList<>();
+        Imgproc.findContours(fgMask, motionContours, hierarchyMat, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
+
+        List<Rect> rawRects = new ArrayList<>();
+        for (MatOfPoint contour : motionContours) {
+            if (Imgproc.contourArea(contour) > MIN_RAW_CONTOUR_AREA) {
+                rawRects.add(Imgproc.boundingRect(contour));
+            }
+        }
+
+        List<Rect> mergedRects = consolidateRects(rawRects);
 
         class Candidate {
             final Car car;
@@ -555,24 +655,29 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
 
         List<Candidate> allCandidates = new ArrayList<>();
 
-        for (Car car : new ArrayList<>(carList)) {
-            Core.inRange(hsvMat, car.lower, car.upper, maskMat);
-            Core.bitwise_and(maskMat, fgMask, combinedMask);
-            Imgproc.dilate(combinedMask, combinedMask, dilateElement);
+        for (Rect rect : mergedRects) {
+            if (rect.width * rect.height > MIN_MERGED_OBJECT_AREA) {
+                Mat objectHsv = new Mat(hsvMat, rect);
+                Mat objectMask = new Mat(fgMask, rect);
+                Scalar blobHsv = Core.mean(objectHsv, objectMask);
 
-            List<MatOfPoint> contours = new ArrayList<>();
-            Imgproc.findContours(combinedMask, contours, hierarchyMat, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
+                objectHsv.release();
+                objectMask.release();
 
-            for (MatOfPoint contour : contours) {
-                if (Imgproc.contourArea(contour) > 500) {
-                    Rect rect = Imgproc.boundingRect(contour);
-                    Mat blobRegion = new Mat(hsvMat, rect);
-                    Scalar blobHsv = Core.mean(blobRegion);
-                    blobRegion.release();
+                Car bestCar = null;
+                double bestScore = Double.MAX_VALUE;
 
+                for (Car car : carList) {
                     double score = car.getScore(blobHsv);
+                    if (score < bestScore) {
+                        bestScore = score;
+                        bestCar = car;
+                    }
+                }
+
+                if (bestCar != null) {
                     Point center = new Point(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
-                    allCandidates.add(new Candidate(car, rect, center, score));
+                    allCandidates.add(new Candidate(bestCar, rect, center, bestScore));
                 }
             }
         }
@@ -665,10 +770,18 @@ public class MainActivity extends AppCompatActivity implements CameraBridgeViewB
         }
 
         public double getScore(Scalar blobColor) {
-            double dH = Math.abs(blobColor.val[0] - targetHsv.val[0]);
+            double h1 = blobColor.val[0];
+            double h2 = targetHsv.val[0];
+
+            // Hue distance with wrapping (0-180 circle)
+            double dH = Math.abs(h1 - h2);
+            if (dH > 90) dH = 180 - dH;
+
             double dS = Math.abs(blobColor.val[1] - targetHsv.val[1]);
             double dV = Math.abs(blobColor.val[2] - targetHsv.val[2]);
-            return dH + dS + dV;
+
+            // Weight Hue higher, weight Value lower (brightness changes easily)
+            return (dH * 2.0) + dS + (dV * 0.5);
         }
     }
 
